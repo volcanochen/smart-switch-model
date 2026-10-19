@@ -1,8 +1,31 @@
 # 技术文档：WorkBuddy 模型切换与 6004 自动切换
 
-> 本文档记录 smart-switch-model 的全部技术细节：证伪记录、CDP 原理、逆向发现、
-> 自动切换架构设计、v2 检测器设计依据，以及 2026-10-19 误切模型事故的完整复盘。
+> 本文档记录 smart-switch-model 的方案细节、逆向发现与踩坑记录，以及 2026-10-19
+> 误切模型事故的完整复盘。操作手册见 `../SKILL.md`，使用说明见 `../README.md`。
 > 实测环境：WorkBuddy 5.5.3 / Electron 37 / Chromium 138 / Windows 11。
+
+---
+
+## 0. 踩坑速查表
+
+| # | 坑 | 结论/解法 |
+|---|---|---|
+| 1 | 直写 db `sessions.model` | ❌ 下游镜像，下一条消息即被 UI 回写覆盖 |
+| 2 | UIA 操控 | ❌ Electron 不暴露 web 控件；沙箱禁 `Add-Type` |
+| 3 | CDP 连 `127.0.0.1:9222` | 返回 403；必须用 `localhost` |
+| 4 | 单实例锁 | 二次启动只激活旧实例（无端口）；须完全退出再带端口启动 |
+| 5 | page/iframe target id 漂移 | 每次动态从 `http://localhost:9222/json` 重新取，勿硬编码 |
+| 6 | 费率解析 | `GLM-5.3`+`0.79x` 连写会误匹配成 `30.79x`；只从**干净模型名之后**的剩余文本匹配倍率 |
+| 7 | `get-user-resource-free-packages` 400 | `PackageCodes` + `pageNumber`/`pageSize` 必填 |
+| 8 | 直接 fetch 服务端接口 | 跨域 `Failed to fetch`；须经 workbuddy.cn 同源 iframe + `credentials:'include'` |
+| 9 | `Runtime.evaluate` awaitPromise 偶发 "Promise was collected" | GC 时序问题，重跑即可 |
+| 10 | app.asar 是二进制 | ripgrep 默认跳过不报匹配；用 `grep -a` |
+| 11 | v1 检测器把"聊到 6004 的文本"当横幅 | 最大坑，一天误切 9 次模型；v2 五条规则重构（§5） |
+| 12 | `delete window.__wbAutoSwitch` 停不了 observer | 闭包不可达；用实例 click 覆盖止血或刷新页面（§6.3） |
+| 13 | 渲染进程刷新会杀进行中的轮次 | 刷新必须空闲感知 + 连续两次确认（§6.3） |
+| 14 | 启发式清理假横幅 | 误删 19 个对话节点；只删 `[data-test="fake-6004"]` 标记节点 |
+| 15 | watch 的 WS 跨页面重载即死 | 须断线重连 + 重装（§4.2） |
+| 16 | git push CRLF 警告 | 无害（Windows 行尾转换），已用 .gitignore 常规忽略 |
 
 ---
 

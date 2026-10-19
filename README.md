@@ -1,156 +1,89 @@
 # smart-switch-model
 
-> WorkBuddy 当前窗口模型切换 + 6004 频率限制自动切换工具集。
-> 通过 Chrome DevTools Protocol（CDP）驱动**真实的模型选择器 UI**，等价于手动点击——真正改变当前窗口模型，且持久化不被回写覆盖。
+**让 WorkBuddy 桌面端听懂“换个模型”这句话**——通过 Chrome DevTools Protocol 驱动真实的模型选择器 UI，把当前窗口切换到指定模型；并在撞上 6004 频率限制时，自动切换到回落模型，全程不打断你的对话。
 
-> 适用环境：WorkBuddy 5.5.3（Electron 37 / Chromium 138）/ Windows。
-> 若客户端升级改了 UI 类名，用 `scripts/cdp/probe.js` 重新探测即可（见 [排障](#排障)）。
+> 适用环境：WorkBuddy 5.5.3+（Electron / Chromium）/ Windows / Node 22+
 
 ---
 
-## 这是什么 / 为什么
+## 这是什么
 
-WorkBuddy 桌面端有几个"看似可行实则不行"的切模型路子（均已实测证伪，详见 [技术文档](docs/TECHNICAL-NOTES.md)）：
+一套开箱即用的脚本工具集 + 一份给 AI Agent 看的技能手册（SKILL.md）。它解决两件事：
 
-| 方法 | 结果 |
-|---|---|
-| 直写 `workbuddy.db` 的 `sessions.model` | ❌ db 只是下游镜像，下一条消息发出去就被 UI 回写覆盖 |
-| Windows UI Automation（UIA） | ❌ Electron 网页内容默认不向 UIA 暴露控件 |
-| **CDP 点击真实模型选择器（本仓库）** | ✅ UI 标签 + 持久化双层验证通过 |
+1. **切换当前窗口的模型**：一条命令，把 WorkBuddy 当前会话切到任意可用模型（Hy3、Step-5-Preview、GLM-5.3-Flash…21 个模型任选），切换真实生效且持久化。
+2. **6004 频率限制自动兜底**：免费模型撞频率限制（错误码 6004）时，页面内的监听器自动切到回落模型，你什么都不用点。
 
-在此基础上，还内置了一套**反应式自动切换**：当撞上 6004 频率限制横幅时，页面内监听器第一时间自动切到回落模型，不用手动点。以及配套的止血/刷新/清理工具（都来自一次真实的"误切模型"事故，见[技术文档第 6 节](docs/TECHNICAL-NOTES.md#6-事故复盘v1-检测器为何乱切模型)）。
+它同时是一份 **Anthropic Skills 兼容格式的技能包**——把 `SKILL.md` 放进任何支持 Agent Skills 的 AI 工具（WorkBuddy、Claude 等），模型就能自己读懂并执行整套流程。
 
-## 功能一览
+## 背景：为什么需要它
 
-- **手动切模型**：`switch.js <模型名>`，内置别名（`hy3`、`step-5-preview`、`fast`、`balanced`、`ultra`…），也接受下拉框显示名
-- **列出模型与费率**：`list_models.js`，直接从真实下拉框读取当前全部模型 + 消费倍率（x）
-- **6004 自动切换**：`autoswitch.js`（test / arm / watch 三模式，v2 检测器，带回归测试）
-- **配套工具**：`neuter_switch.js`（止血）、`reload_page.js`（安全刷新）、`cleanup_fake6004.js`（清理测试残留）
-- **积分余额查询（附赠）**：`query_quota.js`，同源 fetch 查询 credits / 奖励包 / 并发智能体
+WorkBuddy 的免费额度模型（0.00x 的 Hy3、Step-5-Preview）用得好好的，但有两个现实痛点：
 
-## 环境要求（一次性）
+- **切模型要点好几下**：模型选择器在输入框旁，每次遇到额度/频率问题都要手动翻 21 个模型的下拉框，找哪个免费、哪个便宜。
+- **撞了 6004 才知道**：频率限制（6004）**无法提前查询**，服务端按请求实时判定，撞上时对话直接中断，只能手动切模型重来。而“还剩多少积分”倒是能查，但本地数据库里没有，要走服务端接口。
 
-CDP 需要渲染进程暴露调试端口。**单实例锁**会让第二次启动只激活旧实例（无调试端口），所以必须：
+调研中我们还实测证伪了两条看似合理的路：**直写本地数据库**（会被 UI 回写覆盖）、**Windows UI 自动化**（Electron 不暴露网页控件）。最终确认唯一可靠的路是 **CDP 驱动真实 UI**——等价于用户亲手点，因此真正生效、不被覆盖。整套方案连同一次“误切模型”事故的复盘，都记录在 [技术文档](docs/TECHNICAL-NOTES.md) 里。
+
+## 用途：能用来干什么
+
+| 场景 | 动作 | 效果 |
+|---|---|---|
+| 积分快见底了 | `node switch.js hy3` | 一键切到 0.00x 免费模型，不烧积分继续用 |
+| 挑花眼，不知道哪个模型便宜 | `node list_models.js` | 列出全部 21 个模型及实时费率（0.00x ~ 1.62x） |
+| 经常撞 6004，想全自动 | `node autoswitch.js arm` | 撞频率限制自动切到回落模型，对话不中断 |
+| 想随时知道余额 | `node query_quota.js` | 查总 credits / 奖励包 / 并发智能体额度 |
+| 让 AI Agent 替你管模型 | 安装 `SKILL.md` | Agent 自动完成上述所有操作 |
+
+## 怎么操作
+
+**第一步：给 WorkBuddy 开调试端口**（一次性，需先完全退出再启动）：
 
 ```powershell
-# 1) 完全退出 WorkBuddy（任务管理器结束 WorkBuddy.exe）
-# 2) 带调试端口启动
 & "C:\Program Files\WorkBuddy\WorkBuddy.exe" --remote-debugging-port=9222
 ```
 
-```bash
-# 验证端口（注意用 localhost，127.0.0.1 会被 Chrome 返回 403）
-curl -s http://localhost:9222/json/version
-```
-
-Node ≥ 22（自带全局 `WebSocket`，无需装任何包）。本仓库脚本默认用
-`C:/Users/adminlocal/.workbuddy/binaries/node/versions/22.22.2-2/node.exe`，换成你机器上的 node 即可。
-
-## 快速开始
+**第二步：跑命令**（脚本目录下，Node 22+，零依赖）：
 
 ```bash
 cd scripts/cdp
-
-# 列出当前下拉框所有模型 + 费率
-node list_models.js
-
-# 切换当前窗口模型
-node switch.js step-5-preview     # 或 hy3 / fast / balanced / ultra / 直接写显示名
-
-# 6004 自动切换：先跑回归测试（dry-run，不真切）
-node autoswitch.js test
-# 注入到当前页，真实模式，立即生效（页面刷新后失效）
-node autoswitch.js arm
-# 常驻看门：每 5s 自愈重装 + WebSocket 断线自动重连
-node autoswitch.js watch
+node switch.js step-5-preview    # 切到 Step-5-Preview
+node list_models.js              # 看所有模型和费率
+node autoswitch.js test          # 先自检自动切换（dry-run，不真切）
+node autoswitch.js arm           # 开启 6004 自动切换
 ```
 
-### 查状态 / 拆除
+**第三步（可选）：让 AI 接管。** 把 `SKILL.md` 放入技能的 skills 目录（如 `~/.workbuddy/skills/smart-switch-model/`），之后直接对 Agent 说“切到 Hy3”“查一下余额”“开启自动切换”即可。
 
-在 WorkBuddy 页面上下文（DevTools Console 或 CDP evaluate）：
+详细参数、回落顺序配置、开机自启、排障，见 **[SKILL.md](SKILL.md)**（操作手册）；逆向细节与踩坑，见 **[技术文档](docs/TECHNICAL-NOTES.md)**。
 
-```js
-window.__wbAutoSwitch.status()   // { armed, detector, current, fallbacks, dryRun, fires, lastEvent }
-delete window.__wbAutoSwitch     // 摘除句柄（注意：停不掉已注入的 observer，见下）
-```
+## 获得什么
 
-**要彻底停掉已经 arm 的监听器**：`delete` 只删句柄，停不了闭包里的 MutationObserver。
-两条真路：`node neuter_switch.js`（屏蔽程序化点击，真人鼠标不受影响）或刷新页面（`node reload_page.js` / 重启 WorkBuddy）。
-
-### 配套工具
-
-| 脚本 | 用途 |
-|---|---|
-| `neuter_switch.js` | **止血**：屏蔽模型选择器上的程序化 `.click()`（脚本驱动的点击被拦），真人鼠标点击不受影响（原生事件分发不经过 JS 的 click 方法）。页面刷新后自动失效。 |
-| `reload_page.js` | **安全刷新**：清掉关不掉的僵尸监听器。默认 90s 后、且**连续两次检测到空闲**（无进行中的对话）才刷，绝不打断对话；刷新同时会把被误删的 DOM 从持久化状态重建。延迟可用 `WB_RELOAD_DELAY_MS` 调。 |
-| `cleanup_fake6004.js` | 清理 `test` 模式残留的假横幅。**只删带 `[data-test="fake-6004"]` 标记的节点**，绝不启发式扫描聊天文本。 |
-
-### 附赠：积分余额查询
-
-```bash
-node query_quota.js   # 需调试端口；通过 workbuddy.cn 同源 iframe fetch，自动带鉴权
-```
-
-可查：总 credits、CreditGroups、奖励包明细、并发智能体额度。**频率限制（6004）不可提前查询**——服务端按请求实时判定，客户端无计数器；只有真撞了才能从那次响应的 `Retry-After` 拿到重置时间。
-
-## 配置（环境变量）
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `WB_FALLBACKS` | `Hy3,GLM-5.3-Flash,Step-5-Preview` | 自动切换的回落顺序（自动跳过当前模型） |
-| `WB_COOLDOWN_MS` | `15000` | 两次自动切换的最小间隔 |
-| `WB_RELOAD_DELAY_MS` | `90000` | 安全刷新的首次检查延迟 |
-
-示例：
-
-```bash
-WB_FALLBACKS="Hy3,Step-5-Preview" WB_COOLDOWN_MS=30000 node autoswitch.js watch
-```
-
-## 开机自启看门（可选）
-
-监听器在页面重载/重登后会丢，用 Windows 计划任务在登录时把 `watch` 模式拉起来（自愈重装 + 断线重连）：
-
-```
-schtasks /Create /TN "WorkBuddy AutoModelSwitch" /SC ONLOGON /F /TR "\"<node.exe 路径>\" \"<本仓库>/scripts/cdp/autoswitch.js\" watch"
-```
-
-> 前提：WorkBuddy 仍须以 `--remote-debugging-port=9222` 启动，否则 watch 连不上。
-
-## 排障
-
-- **`no page target` / 连不上**：WorkBuddy 没带调试端口启动，或重启后 page id 变了——脚本每次动态从 `http://localhost:9222/json` 取目标，一般无需手工干预。
-- **切了没反应 / 类名失效**：客户端升级改了 DOM 结构。跑 `node probe.js` / `node open_dropdown.js` 重新探测类名，改脚本里的 `.cr-model-selector__*` 选择器。
-- **自动切换不触发**：v2 检测器是保守设计（宁可漏、不可乱切）。跑 `node autoswitch.js test` 看回归测试是否 PASS；若真实横幅命中不了，放宽 `isRateLimitBanner` 里的 class 匹配（见技术文档 v2 设计）。
-- **模型自己乱跳**：看 `window.__wbAutoSwitch.status().fires` 与 `lastEvent`。若在涨且没有真实横幅，说明检测器误报——立即 `node neuter_switch.js` 止血，然后 `node reload_page.js` 清场。
-
-## 安全提示
-
-- `--remote-debugging-port=9222` 会暴露本地渲染进程，**本机任何进程都能连**。实验完建议正常退出并以不带调试端口的方式重启 WorkBuddy。
-- 所有脚本只点 UI / 只读查询，不改 WorkBuddy 数据库；切换可逆（再点一次即可）。
-
-## 文档
-
-- [技术文档 TECHNICAL-NOTES.md](docs/TECHNICAL-NOTES.md)：CDP 原理、DOM 结构与逆向发现、费率/配额/错误码机制、自动切换架构、v2 检测器设计、事故复盘
-- [SKILL.md](SKILL.md)：WorkBuddy Agent Skill 格式的操作手册（可直接放进 `~/.workbuddy/skills/switch-model/`）
+- **省时间**：切模型从“点开下拉、翻 21 项、找免费”变成一条命令；Agent 模式下就是一句话。
+- **不中断**：真撞 6004 时自动切到回落模型（默认 Hy3 → GLM-5.3-Flash → Step-5-Preview），失败那轮点“继续”即可，不用手动救火。
+- **可预期**：随时查看模型费率快照与积分余额，额度规划从盲猜变成明账。
+- **可复用/可迁移**：纯 Node 脚本 + CDP，无任何第三方依赖；SKILL.md 是 Anthropic Skills 兼容格式，可被任何支持 Skills 的 LLM 工具直接加载使用。
+- **踩过的坑都写下来了**：包括一次把“聊到 6004 的文本”误判成错误横幅导致一天误切 9 次模型的事故，检测器已重写并内置回归测试——你不必再踩一遍。
 
 ## 目录结构
 
 ```
 smart-switch-model/
-├── README.md                # 本文件（使用说明）
-├── SKILL.md                 # WorkBuddy Skill 格式文档
+├── README.md                 # 本文件：是什么 / 背景 / 用途 / 操作 / 收益
+├── SKILL.md                  # Agent Skills 兼容技能手册（给 LLM 用）
 ├── docs/
-│   └── TECHNICAL-NOTES.md   # 技术文档（逆向结论 + 架构 + 事故复盘）
-└── scripts/cdp/
-    ├── cdp.js               # 最小 CDP 客户端（connect/send/evaluate）
-    ├── switch.js            # 手动切模型
-    ├── list_models.js       # 列出模型与费率
-    ├── autoswitch.js        # 6004 自动切换（v2 检测器；test/arm/watch）
-    ├── neuter_switch.js     # 止血：屏蔽程序化点击
-    ├── reload_page.js       # 安全刷新（空闲感知）
-    ├── cleanup_fake6004.js  # 清理测试假横幅（仅删标记节点）
-    ├── query_quota.js       # 积分余额查询（附赠）
-    ├── probe.js             # DOM 结构探测（客户端升级后用）
-    └── open_dropdown.js     # 打开下拉框并 dump 选项（探测用）
+│   └── TECHNICAL-NOTES.md    # 技术文档：方案细节、逆向发现、踩坑记录
+└── scripts/cdp/              # 全部脚本（Node 22+，零依赖）
+    ├── cdp.js                #   最小 CDP 客户端
+    ├── switch.js             #   切换模型
+    ├── list_models.js        #   模型 + 费率列表
+    ├── autoswitch.js         #   6004 自动切换（含回归测试）
+    ├── neuter_switch.js      #   止血：拦停异常切换
+    ├── reload_page.js        #   安全刷新：清理僵尸监听器
+    ├── cleanup_fake6004.js   #   清理测试残留
+    ├── query_quota.js        #   积分余额查询
+    └── probe.js / open_dropdown.js   # DOM 探测（客户端升级后用）
 ```
+
+## 安全提示
+
+调试端口会暴露本地渲染进程（本机任意进程可连），用完建议以不带端口的方式重启 WorkBuddy。所有脚本只操作 UI / 只读查询，不改 WorkBuddy 数据库，切换可逆。
