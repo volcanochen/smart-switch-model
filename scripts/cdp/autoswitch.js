@@ -1,18 +1,25 @@
-// Auto-switch model the instant a REAL rate-limit (6004) banner appears.
+// Auto-switch model the instant a REAL rate-limit (6004) banner appears,
+// then auto-send "继续" so the interrupted agent turn resumes on the new model.
 //
 // Why not a WorkBuddy "定时任务/automation"?  Those run discrete scheduled agent turns;
 // they can't react mid-conversation and can't pre-detect a rate limit.  The real-time
 // reaction must live IN the page (a MutationObserver).  A scheduled task's only real job
 // here is to KEEP this watcher process alive across reboots/logins.
 //
-// Modes:
-//   node autoswitch.js arm     inject the reactor into the current page (idempotent)
-//   node autoswitch.js watch   inject + keep it armed (self re-arm + reconnect every 5s); long-running
+// Modes (arm and watch are identical; both stay in the foreground, Ctrl+C to stop):
+//   node autoswitch.js arm     inject the reactor + listen for resume requests
+//   node autoswitch.js watch   same as arm (documented as the long-running form)
 //   node autoswitch.js test    inject (dry-run) + fire a FAKE 6004 banner, report detection
+//                              + dry-test the resume INSERT path (types into the REAL
+//                                composer, verifies, clears - never clicks send)
 //
 // Config (env):
 //   WB_FALLBACKS="Hy3,GLM-5.3-Flash,Step-5-Preview"   ordered fallback list (skips current)
 //   WB_COOLDOWN_MS=15000                              min gap between auto-switches
+//   WB_RESUME=1                                       auto-send resume text after a successful switch (0=off)
+//   WB_RESUME_TEXT="继续"                              the text auto-sent to resume the interrupted turn
+//   WB_RESUME_WINDOW_MS=90000                         resume only if an agent turn was active within this window
+//   WB_HIDE_BANNER=1                                  remove the detected 6004 banner node after switching (0=keep)
 //
 // Prereq: WorkBuddy started with --remote-debugging-port=9222 (same as switch-model skill).
 //
@@ -32,6 +39,23 @@
 //      re-render after we already switched away must not re-fire)
 // Trade-off: if the real banner's DOM ever lacks error/notice/banner-ish classes, v2
 // stays silent (no auto-switch; user switches manually) instead of switching by mistake.
+//
+// RESUME (auto-send "继续", 2026-10-19):
+// After a SUCCESSFUL switch, if an agent turn was active within resumeWindowMs and the
+// turn has stopped, the reactor logs a RESUME request; this process types the resume
+// text via CDP Input.insertText and then tells the page to click send.
+//
+// Why the split (page reactor vs Node-side typing)?  The composer is a Slate editor
+// (data-slate-editor). Verified 2026-10-19: EVERY in-page synthetic editing event
+// (beforeinput insertText, paste ClipboardEvent, click+beforeinput) is consumed
+// (preventDefault) but NEVER lands in Slate's model - and execCommand('insertText')
+// bypasses the model entirely (text lands in DOM, model stays empty -> clicking send
+// would send an EMPTY message). Only CDP Input.insertText (trusted browser input
+// pipeline) reliably writes into the Slate model. So: switch stays in-page (clicks are
+// fine), but the actual typing must be driven from here over CDP.
+//
+// HARD SAFETY RULE: we only click send AFTER verifying the composer verifiably
+// contains the resume text. Never send on an unverified/empty composer.
 
 const { connect, send, evaluate } = require('./cdp');
 
@@ -39,13 +63,18 @@ const mode = process.argv[2] || 'arm';
 const FALLBACKS = (process.env.WB_FALLBACKS || 'Hy3,GLM-5.3-Flash,Step-5-Preview')
   .split(',').map(s => s.trim()).filter(Boolean);
 const COOLDOWN = parseInt(process.env.WB_COOLDOWN_MS || '15000', 10);
+const RESUME = (process.env.WB_RESUME || (mode === 'test' ? '0' : '1')) !== '0';
+const RESUME_TEXT = process.env.WB_RESUME_TEXT || '继续';
+const RESUME_WINDOW_MS = parseInt(process.env.WB_RESUME_WINDOW_MS || '90000', 10);
+const HIDE_BANNER = (process.env.WB_HIDE_BANNER || '1') !== '0';
 
 // ---- the reactor, injected into the page. Self-contained. ----
 function reactorSource(cfg) {
   return `
   (function(){
-    if (window.__wbAutoSwitch) { window.__wbAutoSwitch.cfg = ${JSON.stringify(cfg)}; return 'already-armed'; }
-    var cfg = ${JSON.stringify(cfg)};
+    if (window.__wbAutoSwitch) { window.__wbAutoSwitch.state.cfg = ${JSON.stringify(cfg)}; return 'already-armed'; }
+    var state = { cfg: ${JSON.stringify(cfg)} };
+    var cfg = state.cfg;
     var fires = [];
     function labelEl(){ return document.querySelector('.cr-model-selector__trigger-label') || document.querySelector('.cr-model-selector__trigger'); }
     function currentModel(){ var e = labelEl(); return e ? e.textContent.replace(/\\s+/g,' ').trim() : ''; }
@@ -55,8 +84,8 @@ function reactorSource(cfg) {
     function findTarget(){
       var cur = currentModel().toLowerCase();
       var items = Array.prototype.slice.call(document.querySelectorAll('.cr-model-selector__item'));
-      for (var i=0;i<cfg.fallbacks.length;i++){
-        var fb = cfg.fallbacks[i].toLowerCase();
+      for (var i=0;i<state.cfg.fallbacks.length;i++){
+        var fb = state.cfg.fallbacks[i].toLowerCase();
         if (fb === cur) continue;
         for (var j=0;j<items.length;j++){
           var n = (items[j].querySelector('.cr-model-selector__item-name')||items[j]).textContent.replace(/\\s+/g,' ').trim();
@@ -86,10 +115,62 @@ function reactorSource(cfg) {
       }
       return true;
     }
+    // ---- resume machinery (auto-send "继续") ----
+    function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+    function sendButton(){ return document.querySelector('button.cr-send-button'); }
+    function chatEditable(){
+      var area = document.querySelector('.conversation-input-area');
+      return area ? area.querySelector('[contenteditable="true"]') : null;
+    }
+    function isAgentActive(){
+      if (document.querySelector('.cr-agent--processing')) return true;
+      var b = sendButton();
+      return !!(b && (b.classList.contains('cr-send-button--stop') || b.classList.contains('cr-send-button--sending')));
+    }
+    var lastActiveAt = isAgentActive() ? Date.now() : 0;
+    setInterval(function(){ if (isAgentActive()) lastActiveAt = Date.now(); }, 2000);
+    function caretToComposerEnd(){
+      var el = chatEditable();
+      if (!el) return 'no-composer';
+      el.focus();
+      var sel = window.getSelection();
+      var range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      sel.removeAllRanges(); sel.addRange(range);
+      return 'caret-set';
+    }
+    function waitSendable(timeoutMs){
+      return new Promise(function(res){
+        var t0 = Date.now();
+        (function poll(){
+          var b = sendButton();
+          var sendable = b && !b.classList.contains('cr-send-button--stop') && !b.classList.contains('cr-send-button--sending') && !b.disabled && b.getAttribute('aria-disabled') !== 'true';
+          if (sendable) return res(b);
+          if (Date.now() - t0 > timeoutMs) return res(null);
+          setTimeout(poll, 250);
+        })();
+      });
+    }
+    // Called by the Node side AFTER Input.insertText verified the text landed.
+    function finishResume(){
+      return waitSendable(10000).then(function(btn){
+        if (!btn) return 'no-send-button';
+        btn.click();
+        return sleep(1200).then(function(){
+          return isAgentActive() ? 'resumed' : 'clicked-unconfirmed';
+        });
+      });
+    }
+    // Called by the Node side to place the caret at the composer end before typing.
+    function composerTextContains(text){
+      var el = chatEditable();
+      return el ? ((el.textContent || '').indexOf(text) !== -1) : false;
+    }
     var lastFire = 0;
-    function doSwitch(reason){
+    function doSwitch(reason, bannerEl, wasActive){
       var now = Date.now();
-      if (now - lastFire < cfg.cooldownMs) return Promise.resolve('cooldown');
+      if (now - lastFire < state.cfg.cooldownMs) return Promise.resolve('cooldown');
       lastFire = now;
       var before = currentModel();
       if (!openSelector()){ var e1={reason:reason,before:before,error:'no-trigger',at:new Date().toISOString()}; fires.push(e1); window.__wbAutoSwitch.lastEvent=e1; return Promise.resolve('no-trigger'); }
@@ -97,7 +178,7 @@ function reactorSource(cfg) {
         setTimeout(function(){
           var t = findTarget();
           if (!t){ closeSelector(); var e2={reason:reason,before:before,error:'no-fallback',at:new Date().toISOString()}; fires.push(e2); window.__wbAutoSwitch.lastEvent=e2; res('no-fallback'); return; }
-          if (cfg.dryRun){
+          if (state.cfg.dryRun){
             closeSelector();
             var ev = { reason:reason, dryRun:true, before:before, to:t.name, at:new Date().toISOString() };
             fires.push(ev); window.__wbAutoSwitch.lastEvent = ev; res('dryrun:'+t.name); return;
@@ -108,6 +189,15 @@ function reactorSource(cfg) {
             var ev = { reason:reason, before:before, after:after, at:new Date().toISOString() };
             fires.push(ev); window.__wbAutoSwitch.lastEvent = ev;
             try { console.log('[wbAutoSwitch] ' + reason + ': ' + before + ' -> ' + after); } catch(e){}
+            var switched = after !== before;
+            if (switched && bannerEl && state.cfg.hideBanner){ try { bannerEl.remove(); } catch(e){} }
+            // resume only: switched OK + a turn was active recently + that turn has now stopped.
+            // The page cannot type into the Slate composer itself (see header), so we ask the
+            // Node side (console channel) to do Input.insertText + finishResume.
+            if (switched && state.cfg.resume && wasActive && !isAgentActive()){
+              ev.resumeRequested = true;
+              try { console.log('[wbAutoSwitch] RESUME ' + JSON.stringify({ text: state.cfg.resumeText, before: before, after: after })); } catch(e){}
+            }
             res(after);
           }, 700);
         }, 400);
@@ -117,14 +207,19 @@ function reactorSource(cfg) {
       for (var i=0;i<muts.length;i++){
         var added = muts[i].addedNodes || [];
         for (var k=0;k<added.length;k++){
-          if (isRateLimitBanner(added[k])) { doSwitch('6004'); return; }
+          if (isRateLimitBanner(added[k])) {
+            var wasActive = (Date.now() - lastActiveAt) < state.cfg.resumeWindowMs;
+            doSwitch('6004', added[k], wasActive);
+            return;
+          }
         }
       }
     });
     obs.observe(document.body, { childList:true, subtree:true });
     window.__wbAutoSwitch = {
-      cfg: cfg, fires: fires, lastEvent: null, doSwitch: doSwitch, isRateLimitBanner: isRateLimitBanner,
-      status: function(){ return { armed:true, detector:'v2', current:currentModel(), fallbacks:cfg.fallbacks, dryRun:cfg.dryRun, fires:fires.length, lastEvent:window.__wbAutoSwitch.lastEvent }; }
+      state: state, cfg: state.cfg, fires: fires, lastEvent: null, doSwitch: doSwitch, isRateLimitBanner: isRateLimitBanner,
+      caretToComposerEnd: caretToComposerEnd, composerTextContains: composerTextContains, finishResume: finishResume,
+      status: function(){ return { armed:true, detector:'v2', current:currentModel(), fallbacks:state.cfg.fallbacks, dryRun:state.cfg.dryRun, resume:state.cfg.resume, resumeText:state.cfg.resumeText, fires:fires.length, lastEvent:window.__wbAutoSwitch.lastEvent }; }
     };
     return 'armed';
   })()
@@ -151,9 +246,79 @@ async function connectPage(retries = 20) {
   throw lastErr;
 }
 
+// ---- Node-side resume driver (see header: only CDP Input.insertText writes into Slate) ----
+let lastResumeAt = 0;
+async function handleResume(ws, req) {
+  const now = Date.now();
+  if (now - lastResumeAt < 2000) return; // dedupe banner re-renders
+  lastResumeAt = now;
+  console.log(`[${new Date().toISOString()}] resume requested: ${JSON.stringify(req)}`);
+  try {
+    // 1) caret to composer end, then trusted insert via CDP
+    await evaluate(ws, `(window.__wbAutoSwitch && window.__wbAutoSwitch.caretToComposerEnd) ? window.__wbAutoSwitch.caretToComposerEnd() : 'not-armed'`);
+    await new Promise(r => setTimeout(r, 150));
+    await send(ws, 'Input.insertText', { text: req.text });
+    await new Promise(r => setTimeout(r, 400));
+    // 2) HARD SAFETY GATE: verify the text really landed in the Slate composer
+    const chk = await evaluate(ws, `(window.__wbAutoSwitch && window.__wbAutoSwitch.composerTextContains) ? (window.__wbAutoSwitch.composerTextContains(${JSON.stringify(req.text)}) ? 'landed' : 'missing') : 'not-armed'`);
+    console.log(`[${new Date().toISOString()}] resume text: ${chk.value}`);
+    if (chk.value !== 'landed') {
+      console.log('resume ABORTED: text not verified in composer - NOT sending');
+      return;
+    }
+    // 3) click send + confirm the turn actually restarted
+    const fin = await evaluate(ws, `(window.__wbAutoSwitch && window.__wbAutoSwitch.finishResume) ? window.__wbAutoSwitch.finishResume().then(function(r){ return r; }) : 'not-armed'`);
+    console.log(`[${new Date().toISOString()}] resume: ${fin.value}`);
+    try { await evaluate(ws, `(window.__wbAutoSwitch && window.__wbAutoSwitch.lastEvent) ? (window.__wbAutoSwitch.lastEvent.resumed = ${JSON.stringify(fin.value)}, 'ok') : 'no-event'`); } catch (e) {}
+  } catch (e) { console.error('resume FAILED:', e.message); }
+}
+
+function attachResumeListener(ws) {
+  ws.addEventListener('message', (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (msg.method !== 'Runtime.consoleAPICalled') return;
+    const args = msg.params && msg.params.args;
+    if (!args || !args.length) return;
+    const a = args[0];
+    const text = a && (a.value !== undefined ? String(a.value) : (a.description || ''));
+    const m = /^\[wbAutoSwitch\] RESUME (\{.*\})\s*$/.exec(text || '');
+    if (!m) return;
+    let req;
+    try { req = JSON.parse(m[1]); } catch (e) { return; }
+    handleResume(ws, req);
+  });
+}
+
+async function serve(ws, cfg) {
+  attachResumeListener(ws);
+  // self-heal: re-arm if the page reloaded and dropped the observer; reconnect if the WS died
+  setInterval(async () => {
+    try {
+      const s = await evaluate(ws, `window.__wbAutoSwitch ? 'OK' : 'NOT-ARMED'`);
+      if (s.value !== 'OK') {
+        await evaluate(ws, reactorSource(cfg));
+        console.log(`[${new Date().toISOString()}] re-armed`);
+      }
+    } catch (e) {
+      try {
+        const ws2 = await connectPage(3);
+        attachResumeListener(ws2);
+        const s2 = await evaluate(ws2, `window.__wbAutoSwitch ? 'OK' : 'NOT-ARMED'`);
+        if (s2.value !== 'OK') {
+          await evaluate(ws2, reactorSource(cfg));
+          console.log(`[${new Date().toISOString()}] reconnected + re-armed`);
+        } else {
+          console.log(`[${new Date().toISOString()}] reconnected (still armed)`);
+        }
+      } catch (e2) { /* app not up yet */ }
+    }
+  }, 5000);
+}
+
 (async () => {
   const ws = await connectPage();
-  const cfg = { fallbacks: FALLBACKS, cooldownMs: COOLDOWN, dryRun: (mode === 'test') };
+  const cfg = { fallbacks: FALLBACKS, cooldownMs: COOLDOWN, dryRun: (mode === 'test'), resume: RESUME, resumeText: RESUME_TEXT, resumeWindowMs: RESUME_WINDOW_MS, hideBanner: HIDE_BANNER };
 
   if (mode === 'test') {
     await evaluate(ws, `delete window.__wbAutoSwitch`); // force a fresh inject so we exercise current code
@@ -183,6 +348,32 @@ async function connectPage(retries = 20) {
       return JSON.stringify({ detector: st.detector, detectedRealBanner: !!detectedReal, falsePositives: falsePos, verdict: (detectedReal && falsePos === 0) ? 'PASS' : 'CHECK' });
     })()`);
     console.log('VERDICT:', v.value);
+    // 3) resume INSERT dry test: exercise the REAL path (caret + Input.insertText + verify + clear).
+    //    NEVER clicks send. Note: this types into the real composer - don't run with an unsent draft.
+    await evaluate(ws, `window.__wbAutoSwitch.caretToComposerEnd()`);
+    await new Promise(r => setTimeout(r, 150));
+    await send(ws, 'Input.insertText', { text: RESUME_TEXT });
+    await new Promise(r => setTimeout(r, 400));
+    const land = await evaluate(ws, `window.__wbAutoSwitch.composerTextContains(${JSON.stringify(RESUME_TEXT)})`);
+    await evaluate(ws, `(function(){
+      var el = document.querySelector('.conversation-input-area [contenteditable="true"]');
+      if (!el) return 'no-composer';
+      el.focus();
+      var sel = window.getSelection();
+      var range = document.createRange();
+      range.selectNodeContents(el);
+      sel.removeAllRanges(); sel.addRange(range);
+      try { document.execCommand('delete'); } catch(e){}
+      return 'cleared';
+    })()`);
+    await new Promise(r => setTimeout(r, 300));
+    const clr = await evaluate(ws, `(function(){
+      var el = document.querySelector('.conversation-input-area [contenteditable="true"]');
+      if (!el) return 'no-composer';
+      var t = (el.textContent || '').replace(/[\\u200B\\uFEFF]/g, '').trim();
+      return t === '' ? 'cleared' : 'leftover:' + t.slice(0, 40);
+    })()`);
+    console.log('resume-insert-dry-run:', JSON.stringify({ inserted: land.value, cleared: clr.value }));
     // cleanup fake nodes
     await evaluate(ws, `document.querySelectorAll('[data-test="fake-6004"],[data-test="fake-6004-fp"]').forEach(function(e){e.remove()})`);
     ws.close();
@@ -191,33 +382,8 @@ async function connectPage(retries = 20) {
 
   await evaluate(ws, `delete window.__wbAutoSwitch`); // fresh install of current code at startup
   const arm = await evaluate(ws, reactorSource(cfg));
-  console.log(`[${new Date().toISOString()}] arm: ${arm.value}  fallbacks=${FALLBACKS.join(' > ')}`);
-
-  if (mode === 'watch') {
-    console.log('watching for 6004... (Ctrl+C to stop)');
-    // self-heal: re-arm if the page reloaded and dropped the observer; reconnect if the WS died
-    setInterval(async () => {
-      try {
-        const s = await evaluate(ws, `window.__wbAutoSwitch ? 'OK' : 'NOT-ARMED'`);
-        if (s.value !== 'OK') {
-          await evaluate(ws, reactorSource(cfg));
-          console.log(`[${new Date().toISOString()}] re-armed`);
-        }
-      } catch (e) {
-        try {
-          const ws2 = await connectPage(3);
-          const s2 = await evaluate(ws2, `window.__wbAutoSwitch ? 'OK' : 'NOT-ARMED'`);
-          if (s2.value !== 'OK') {
-            await evaluate(ws2, reactorSource(cfg));
-            console.log(`[${new Date().toISOString()}] reconnected + re-armed`);
-          } else {
-            console.log(`[${new Date().toISOString()}] reconnected (still armed)`);
-          }
-        } catch (e2) { /* app not up yet */ }
-      }
-    }, 5000);
-    setInterval(() => {}, 1000); // keep process alive
-  } else {
-    ws.close();
-  }
+  console.log(`[${new Date().toISOString()}] arm: ${arm.value}  fallbacks=${FALLBACKS.join(' > ')}  resume=${RESUME ? '"' + RESUME_TEXT + '"' : 'off'}`);
+  console.log('listening for 6004 banners + resume requests... (Ctrl+C to stop)');
+  await serve(ws, cfg);
+  setInterval(() => {}, 1000); // keep process alive
 })().catch(e => { console.error('FAILED:', e.message); process.exit(1); });

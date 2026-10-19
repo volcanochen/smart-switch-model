@@ -26,6 +26,9 @@
 | 14 | 启发式清理假横幅 | 误删 19 个对话节点；只删 `[data-test="fake-6004"]` 标记节点 |
 | 15 | watch 的 WS 跨页面重载即死 | 须断线重连 + 重装（§4.2） |
 | 16 | git push CRLF 警告 | 无害（Windows 行尾转换），已用 .gitignore 常规忽略 |
+| 17 | Slate 输入框：页内合成编辑事件（`beforeinput`/`paste`）被消费但不落字 | 唯一可靠是 CDP `Input.insertText`（可信管道）；见 §4.4 |
+| 18 | `execCommand('insertText')` 绕过 Slate 模型 | 文本落 DOM、模型为空 → 点发送会发**空消息**；禁用（§4.4） |
+| 19 | Slate 内部 selection 靠异步 `selectionchange` 同步 | 程序化设光标后不能同一同步块内派发编辑事件（实测仍不落字，勿依赖） |
 
 ---
 
@@ -75,6 +78,27 @@ WorkBuddy 是 Electron/Chromium 应用，以 `--remote-debugging-port=9222` 启�
 ```
 
 > ⚠️ 客户端升级可能改类名。探测工具：`scripts/cdp/probe.js`、`open_dropdown.js`。
+
+### 2.2 聊天输入框 DOM 结构（5.5.3 实测，2026-10-19 补充）
+
+输入框是 **Slate 编辑器**（`data-slate-editor="true"` / `data-slate-node="value"` /
+`data-slate-leaf` / `data-slate-zero-width`），挂在一个 `sc-editor` 自定义编辑器外壳里：
+
+```
+.conversation-input-area                输入区容器
+├── .conversation-input-area__input-stack
+├── .cr-input-editor-host
+│   └── ._editorWrapper_xxx > .sc-editor._editorRoot_xxx
+│       └── .sc-editor-content
+│           └── div[role="textbox"][contenteditable="true"]._editable_xxx   ← Slate 编辑器本体
+└── button.cr-send-button                发送键
+    ├── （空闲）无状态类
+    └── （processing）cr-send-button--sending cr-send-button--stop，文字"停止"
+```
+
+稳定定位方式：`.conversation-input-area [contenteditable="true"]`（哈希类名
+`_editable_11uqr_1` 会随构建变，勿直接依赖）。占位符"今天帮你做些什么？…"是 Slate
+的 decoration 文本节点，不是真实内容。探测工具：`scripts/cdp/probe_composer.js`。
 
 ## 3. 逆向发现：模型、费率与配额
 
@@ -162,7 +186,15 @@ WorkBuddy 的定时任务按计划跑**独立的 agent 轮次**：既不能在�
 │    · 监听 document.body childList+subtree   │
 │    · v2 检测器判定真实 6004 横幅（见第 5 节）  │
 │    · doSwitch: 打开选择器 → 找回落项 → 点击   │
-│    · 冷却 15s；只切模型、不自动重发失败轮次    │
+│    · 冷却 15s                                │
+│    · 满足续跑条件时 console 发出 RESUME 请求   │
+└──────────────┬────────────────────────────┘
+               │ Runtime.consoleAPICalled
+┌──────────────▼────────────────────────────┐
+│  Node 侧 resume 驱动（必须常驻，见 §4.4）     │
+│    · Input.insertText 把"继续"写进 Slate 模型 │
+│    · 验证落字（不过则放弃，绝不空发）          │
+│    · finishResume: 等发送键就绪 → 点击 → 确认  │
 └───────────────────────────────────────────┘
 ```
 
@@ -172,7 +204,48 @@ WorkBuddy 的定时任务按计划跑**独立的 agent 轮次**：既不能在�
   `.cr-model-selector__item-name` 文本精确匹配，大小写不敏感）。
 - 下拉项只在展开后才存在于 DOM → 先 `trigger.click()` 展开，400ms 后查找，点击后
   700ms 回读确认。
-- 只切模型、**不自动重发**失败那轮（避免误触发送）；用户点"继续/重发"时用的已是新模型。
+- 切换成功后若 `WB_HIDE_BANNER=1`（默认），移除检测到的那个横幅节点本身（持有的是
+  MutationObserver 回调里的精确引用，外科手术式移除，不是启发式扫描）。
+- 续跑由 Node 侧完成，见 §4.4。
+
+### 4.4 自动续跑流水线（2026-10-19）
+
+**触发条件（页内判定，全部满足才请求续跑）**：① 切换成功（`after !== before`）；
+② 90 秒内（`WB_RESUME_WINDOW_MS`）确有 Agent 任务在跑（2s 轮询
+`.cr-agent--processing` / 发送键 `--stop` 类，记录 `lastActiveAt`）；③ 切换完成时
+任务已停下（不会去抢一个还在跑的轮次）；④ `WB_RESUME != 0`。
+
+**页内 → Node 的通道**：页内不能自己打字（见下），所以 reactor 用
+`console.log('[wbAutoSwitch] RESUME {...}')` 发请求；Node 侧监听
+`Runtime.consoleAPICalled` 接收。切换本身仍全在页内完成（React 按钮吃程序化 click，
+已多次验证）。
+
+**为什么打字必须在 Node 侧（实测结论，2026-10-19）**：输入框是 Slate 编辑器
+（§2.2）。对四种页内注入方式做了对照实验：
+
+| 方式 | 结果 |
+|---|---|
+| 合成 `beforeinput`（insertText） | 被 preventDefault 消费，**不落字** |
+| 合成 `paste`（带 DataTransfer） | 被消费，**不落字** |
+| 可信 `el.click()` 后合成 `beforeinput` | 被消费，**不落字** |
+| `execCommand('insertText')` | 文本落进 DOM 但 **Slate 模型未更新** → 点发送会发空消息 |
+| **CDP `Input.insertText`** | ✅ **落字且进模型**（唯一可靠） |
+
+即：页内所有合成编辑事件都被 app/Slate 的前端层拦下；只有走浏览器可信输入管道的
+CDP `Input.insertText` 能真正写入 Slate 模型。这就是 `arm` 必须常驻的原因——
+进程退出 = 失去续跑能力（检测+切换仍在页面内，由 watch 自愈维持）。
+
+**Node 侧三步（每步可失败可放弃）**：
+1. 页内置光标到输入框末尾（`caretToComposerEnd`）→ 150ms → `Input.insertText`。
+2. **安全闸**：读 `composerTextContains(text)`，文字没落进输入框就**放弃**，
+   绝不点发送（杜绝空消息）。
+3. `finishResume()`：轮询等发送键就绪（无 `--stop`/`--sending`、未 disabled，
+   最多 10s）→ `click()` → 1.2s 后确认 `.cr-agent--processing`/发送键又进入
+   processing 态 → 结果写回 `lastEvent.resumed`（`resumed` / `clicked-unconfirmed` /
+   失败原因）。
+
+`WB_RESUME=0` 可完全退回"只切模型"的老行为；`WB_RESUME_TEXT` 改续跑文字
+（默认"继续"）。
 
 ## 5. v2 检测器设计
 
@@ -210,6 +283,9 @@ WorkBuddy 的定时任务按计划跑**独立的 agent 轮次**：既不能在�
   → **必须命中**（dry-run，不真切）。
 - 注入两条含同样关键词但放在 `.cr-markdown` 里的聊天文本 → **必须 0 误报**。
 - 判定输出 `VERDICT: PASS`。
+- resume 插入干跑：对**真实输入框**走一遍 `caretToComposerEnd → Input.insertText →
+  composerTextContains → 清空`，报告 `inserted/cleared`（**不点发送**；用户有未发送
+  草稿时别跑）。
 - 额外的活体证据：arm 后静默观察，推理流式输出大量 6004 相关文本，`fires` 应恒为 0。
 
 ## 6. 事故复盘：v1 检测器为何乱切模型（2026-10-19）
@@ -250,10 +326,13 @@ v1 检测规则 = "新增 DOM 文本含 `6004` + 频率/重置等字样即切"�
 
 ## 7. 已知限制
 
-- **类名耦合**：`.cr-model-selector__*` 与检测器的 class 特征随客户端升级可能变化，
-  用 `probe.js` 重新探测。
+- **类名耦合**：`.cr-model-selector__*`、输入框选择器与检测器的 class 特征随客户端升级可能变化，
+  用 `probe.js` / `probe_composer.js` 重新探测。
 - **检测器保守**：可能漏掉结构异常的真实横幅（设计取舍，见 5.3）。
-- **只切模型不重发**：失败那轮需要用户手动"继续/重发"。
+- **续跑依赖常驻进程**：`arm`/`watch` 进程退出后只剩页面内的检测+切换（自愈维持），
+  自动发"继续"需要进程活着（Slate 输入管道的硬限制，见 §4.4）。
+- **续跑窗口 90s**：横幅出现前超过 90 秒没有活动任务时不续跑（避免平白发起新轮次）；
+  真需要时调大 `WB_RESUME_WINDOW_MS`。
 - **watch 模式跨页面重载**：已实现断线重连；但 WorkBuddy 完全退出后需重新拉起
   （计划任务 ONLOGON 只覆盖登录时机）。
 - **调试端口安全**：9222 端口本机任意进程可连，用完建议关（正常退出后不带端口重启）。
