@@ -54,7 +54,7 @@ description: 切换 WorkBuddy 桌面端当前窗口（当前会话）的运行�
 2. `node autoswitch.js arm` 注入监听器并进入常驻监听（真实模式，**前台运行，Ctrl+C 停止**；每 5s 自愈重装 + 断线重连）。
 3. 开机自启：`schtasks /Create /TN "WorkBuddy AutoModelSwitch" /SC ONLOGON /F /TR "\"<node.exe>\" \"<repo>/scripts/cdp/autoswitch.js\" watch"`
 4. 行为说明：撞 6004 横幅 → 按 `WB_FALLBACKS`（默认 `Hy3,GLM-5.3-Flash,Step-5-Preview`，自动跳过当前模型）切到第一个可用项；冷却 15s；切换成功且 90 秒内确有任务在跑且已停下 → 自动输入"继续"（默认文字，`WB_RESUME_TEXT` 可改）→ 验证落字 → 点发送 → 确认新轮次启动。用户全程无需操作。
-5. 常用配置：`WB_FALLBACKS`、`WB_COOLDOWN_MS`、`WB_RESUME`（0=只切模型不续跑）、`WB_RESUME_TEXT`、`WB_RESUME_WINDOW_MS`、`WB_HIDE_BANNER`（环境变量）。
+5. 常用配置：`WB_FALLBACKS`、`WB_COOLDOWN_MS`、`WB_RESUME`（0=只切模型不续跑）、`WB_RESUME_TEXT`、`WB_RESUME_WINDOW_MS`、`WB_HIDE_BANNER`（**默认开启**；撞 6004 切模型后**点横幅右上角的 X 关闭按钮**让 React 干净移除节点，再自动输入“继续”+发送。⚠️ 早期版本直接 `remove()` 横幅节点会致渲染进程崩溃 ConversationBannerSlot removeChild NotFoundError，已改为点 X 关闭，绝不手动删/隐藏节点）。
 6. **为什么必须常驻**：输入框是 Slate 编辑器，页内合成输入事件不落字（见技术文档），"继续"只能由本进程经 CDP `Input.insertText` 输入——进程退出即失去自动续跑能力（检测+切换仍在页面内自愈）。
 
 ### C. 查积分余额

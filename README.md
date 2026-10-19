@@ -4,6 +4,12 @@
 
 > 适用环境：WorkBuddy 5.5.3+（Electron / Chromium）/ Windows / Node 22+
 
+## 演示
+
+![6004 自动切换 + 自动续跑实机演示](docs/demo.gif)
+
+> 实机录屏：Agent 任务撞上 6004 频率限制 → 自动切到回落模型 → 点横幅右上角 X 关闭 → 自动输入"继续"并发送，新模型从断点接着跑。原视频 45.7MB，GIF 2.9MB。
+
 ---
 
 ## 这是什么
@@ -158,8 +164,10 @@ delete window.__wbAutoSwitch
 smart-switch-model/
 ├── README.md                 # 本文件：是什么 / 背景 / 用途 / 操作 / 收益
 ├── SKILL.md                  # Agent Skills 兼容技能手册（给 LLM 用）
+├── restart-with-debug-port.bat  # 一键带调试端口重启 WorkBuddy（Windows）
 ├── docs/
-│   └── TECHNICAL-NOTES.md    # 技术文档：方案细节、逆向发现、踩坑记录
+│   ├── TECHNICAL-NOTES.md    # 技术文档：方案细节、逆向发现、踩坑记录
+│   └── demo.gif              # 6004 自动切换 + 自动续跑实机演示（2.9MB）
 └── scripts/cdp/              # 全部脚本（Node 22+，零依赖）
     ├── cdp.js                #   最小 CDP 客户端
     ├── switch.js             #   切换模型
@@ -171,6 +179,15 @@ smart-switch-model/
     ├── query_quota.js        #   积分余额查询
     └── probe.js / open_dropdown.js / probe_composer.js   # DOM 探测（客户端升级后用）
 ```
+
+## 更新记录
+
+### 2026-10-20 · 渲染进程崩溃修复与鲁棒性改进
+
+- **修复：6004 横幅关闭方式**（`autoswitch.js`）。旧版在切模型成功后直接 `bannerEl.remove()` 删掉横幅 DOM 节点——横幅是 React 管理的，这会让渲染进程在下次更新该节点时崩溃（`NotFoundError: Failed to execute 'removeChild'`，错误边界弹出"出错了"，`ConversationBannerSlot` 组件栈）。现改为**点击横幅右上角的 X 关闭按钮**（匹配 `aria-label="关闭"` / `*-close`），走 React 自己的 onClose 干净移除节点；找不到关闭按钮时保持横幅原样，**绝不手动删/隐藏节点**。
+- **修复：动态发现页面目标**（`switch.js` / `list_models.js` / `open_dropdown.js` / `probe.js`）。旧版把作者机器的 page target ID 写死在脚本里（`ws://.../devtools/page/3332…`），换机器或重启后必然连不上。现改为每次从 `http://localhost:9222/json` 动态发现（优先匹配 WorkBuddy 页面），调试端口未开时给出明确报错。
+- **文档**：SKILL.md 同步更新横幅关闭行为与配置说明。
+- **新增**：`restart-with-debug-port.bat`——一键带调试端口重启 WorkBuddy 的便捷脚本。
 
 ## 安全提示
 

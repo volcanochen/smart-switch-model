@@ -19,7 +19,7 @@
 //   WB_RESUME=1                                       auto-send resume text after a successful switch (0=off)
 //   WB_RESUME_TEXT="继续"                              the text auto-sent to resume the interrupted turn
 //   WB_RESUME_WINDOW_MS=90000                         resume only if an agent turn was active within this window
-//   WB_HIDE_BANNER=1                                  remove the detected 6004 banner node after switching (0=keep)
+//   WB_HIDE_BANNER=1                                  click the banner's close (X) button after switching (default on)
 //
 // Prereq: WorkBuddy started with --remote-debugging-port=9222 (same as switch-model skill).
 //
@@ -66,6 +66,9 @@ const COOLDOWN = parseInt(process.env.WB_COOLDOWN_MS || '15000', 10);
 const RESUME = (process.env.WB_RESUME || (mode === 'test' ? '0' : '1')) !== '0';
 const RESUME_TEXT = process.env.WB_RESUME_TEXT || '继续';
 const RESUME_WINDOW_MS = parseInt(process.env.WB_RESUME_WINDOW_MS || '90000', 10);
+// Banner dismissal (WB_HIDE_BANNER, default ON): on switch, click the banner's real close
+// (X) button so React removes the node cleanly. We NEVER remove/hide the node ourselves -
+// that crashes the renderer (NotFoundError removeChild in ConversationBannerSlot, 2026-10-20).
 const HIDE_BANNER = (process.env.WB_HIDE_BANNER || '1') !== '0';
 
 // ---- the reactor, injected into the page. Self-contained. ----
@@ -167,6 +170,21 @@ function reactorSource(cfg) {
       var el = chatEditable();
       return el ? ((el.textContent || '').indexOf(text) !== -1) : false;
     }
+    // Dismiss a rate-limit banner the React-safe way: click its real close (X) button
+    // so React removes the node cleanly. NEVER remove/hide the node ourselves - that crashes
+    // the renderer (NotFoundError removeChild in ConversationBannerSlot, observed 2026-10-20).
+    function closeBanner(bannerEl){
+      var root = bannerEl;
+      for (var i=0;i<8 && root && root.closest;i++){
+        var w = root.closest('[class*=error],[class*=notice],[class*=banner],[class*=alert],[class*=toast],[class*=widget]');
+        if (w){
+          var btn = w.querySelector('[aria-label="关闭"],[aria-label="close"],[aria-label="Close"],button[class*=close]');
+          if (btn){ try { btn.click(); } catch(e){} return true; }
+        }
+        root = root.parentElement;
+      }
+      return false;
+    }
     var lastFire = 0;
     function doSwitch(reason, bannerEl, wasActive){
       var now = Date.now();
@@ -190,7 +208,7 @@ function reactorSource(cfg) {
             fires.push(ev); window.__wbAutoSwitch.lastEvent = ev;
             try { console.log('[wbAutoSwitch] ' + reason + ': ' + before + ' -> ' + after); } catch(e){}
             var switched = after !== before;
-            if (switched && bannerEl && state.cfg.hideBanner){ try { bannerEl.remove(); } catch(e){} }
+            if (switched && bannerEl && state.cfg.hideBanner){ closeBanner(bannerEl); }
             // resume only: switched OK + a turn was active recently + that turn has now stopped.
             // The page cannot type into the Slate composer itself (see header), so we ask the
             // Node side (console channel) to do Input.insertText + finishResume.

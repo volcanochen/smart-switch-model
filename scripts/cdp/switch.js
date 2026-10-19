@@ -7,7 +7,20 @@
 //   node switch.js --list           (dump available options)
 
 const { connect, evaluate, enableRuntime } = require('./cdp');
-const PAGE_WS = 'ws://localhost:9222/devtools/page/3332565E9349B953653BFC00FEA1D180';
+
+// Dynamically discover the WorkBuddy page target (page ids are per-session, never hardcode).
+async function pageWs() {
+  let list;
+  try {
+    list = await (await fetch('http://localhost:9222/json')).json();
+  } catch (e) {
+    throw new Error('debug port 9222 unreachable - restart WorkBuddy with --remote-debugging-port=9222');
+  }
+  const t = list.find(x => x.type === 'page' && /workbuddy/i.test((x.url || '') + ' ' + (x.title || '')))
+         || list.find(x => x.type === 'page');
+  if (!t) throw new Error('no page target (is the debug port up?)');
+  return t.webSocketDebuggerUrl;
+}
 
 // friendly id / alias  ->  dropdown DISPLAY name (cr-model-selector__item-name text)
 const NAME_MAP = {
@@ -25,7 +38,7 @@ const arg = process.argv[2] || 'step-5-preview';
 
 (async () => {
   if (arg === '--list' || arg === '-l') {
-    const ws = await connect(PAGE_WS);
+    const ws = await connect(await pageWs());
     await enableRuntime(ws);
     const r = await evaluate(ws, `(async () => {
       const t = document.querySelector('.cr-model-selector__trigger');
@@ -46,7 +59,7 @@ const arg = process.argv[2] || 'step-5-preview';
   const tJson = JSON.stringify(target);
   const tJsonLower = JSON.stringify(target.toLowerCase());
 
-  const ws = await connect(PAGE_WS);
+  const ws = await connect(await pageWs());
   await enableRuntime(ws);
 
   const expr = `(async () => {
