@@ -1,0 +1,6 @@
+# 探测/实验过程的临时产物
+*.log
+*.tmp
+node_modules/
+.DS_Store
+Thumbs.db
